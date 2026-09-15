@@ -2,11 +2,8 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
-	"fmt"
 	msg "key_value_store/msg"
 	"net/http"
-	"strconv"
 	"sync"
 )
 
@@ -48,13 +45,8 @@ func Gethandler(w http.ResponseWriter, r *http.Request) {
 var Map map[string]string
 
 func main() {
-	var port int
 	Map = make(map[string]string)
-	flag.IntVar(&port, "port", 8081, "help for port ")
-	flag.Parse()
 	http.HandleFunc("/GET", Gethandler)
 	http.HandleFunc("/PUT", Puthandler)
-	portString := ":" + strconv.Itoa(port)
-	fmt.Println(portString)
-	http.ListenAndServe(portString, nil)
+	http.ListenAndServe(":8080", nil)
 }

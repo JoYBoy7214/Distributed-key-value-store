@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+
 	"hash/fnv"
 	"io"
 	message "key_value_store/msg"
@@ -15,6 +17,10 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
 )
 
 type Server struct {
@@ -81,6 +87,71 @@ func HashHelper(key string) int32 {
 	return int32(ans)
 }
 
+func ConfigServers(Port ServerInfo) {
+	urlString := Port.Url
+	curUrl, err := url.Parse(urlString)
+	if err != nil {
+		log.Fatal("unable to parse the url")
+	}
+	Servers.AddServer(&Server{
+		url:    curUrl,
+		Rproxy: httputil.NewSingleHostReverseProxy(curUrl),
+		Weight: Port.Weight,
+	})
+
+}
+
+func WatchDockerEvents(ch *ConsistantHash) {
+	cli, _ := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+
+	filter := filters.NewArgs()
+	filter.Add("label", "com.docker.compose.service=node")
+	filter.Add("event", "start")
+	filter.Add("event", "die")
+
+	options := events.ListOptions{
+		Filters: filter,
+	}
+	fmt.Println("WatchDocker event lanched")
+
+	ctx := context.Background()
+	msgs, errs := cli.Events(ctx, options)
+
+	for {
+		select {
+		case msg := <-msgs:
+			go handleSingleEvent(ctx, cli, msg, ch)
+		case err := <-errs:
+			log.Printf("Docker event error: %v", err)
+			return
+		case <-ctx.Done():
+			fmt.Println("context done")
+			return
+		}
+	}
+}
+
+func handleSingleEvent(ctx context.Context, cli *client.Client, msg events.Message, ring *ConsistantHash) {
+	if msg.Action == "start" {
+		inspect, _ := cli.ContainerInspect(ctx, msg.Actor.ID)
+
+		for _, net := range inspect.NetworkSettings.Networks {
+			if net.IPAddress != "" {
+				fullUrl := fmt.Sprintf("http://%s:8080", net.IPAddress)
+				curUrl, err := url.Parse(fullUrl)
+				if err != nil {
+					log.Fatal("unable to parse the url")
+				}
+				ring.AddServer(&Server{
+					url:    curUrl,
+					Weight: 5,
+				})
+				break // Only breaks the network-search loop
+			}
+		}
+	}
+}
+
 func RequestHandlerGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("content-Type", "application/json")
 	var msg message.Getmsg
@@ -125,6 +196,7 @@ func RequestHandlerGet(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "key not found", http.StatusNotFound)
 
 }
+
 func RequestHandlerPut(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("content-Type", "application/json")
 	var msg message.Getmsg
@@ -166,21 +238,6 @@ func RequestHandlerPut(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "key not found", http.StatusNotFound)
 }
 
-var Servers ConsistantHash
-
-func ConfigServers(Port ServerInfo) {
-	urlString := Port.Url
-	curUrl, err := url.Parse(urlString)
-	if err != nil {
-		log.Fatal("unable to parse the url")
-	}
-	Servers.AddServer(&Server{
-		url:    curUrl,
-		Rproxy: httputil.NewSingleHostReverseProxy(curUrl),
-		Weight: Port.Weight,
-	})
-
-}
 func AddServerHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("content-Type", "application/json")
 	var serverInfo ServerInfo
@@ -193,13 +250,21 @@ func AddServerHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 }
+
+var Servers ConsistantHash
+
 func main() {
 	Servers.ServerMapping = make(map[int]*Server)
 	Servers.NumberVirtualNodes = 5
 	Servers.NumberOfRepicationNode = 3
+	go WatchDockerEvents(&Servers)
 	http.HandleFunc("/GET", RequestHandlerGet)
 	http.HandleFunc("/PUT", RequestHandlerPut)
-	http.HandleFunc("/AddServer", AddServerHandler)
-	http.ListenAndServe(":8080", nil)
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("health endpoint worling")
+		w.WriteHeader(http.StatusOK)
+	})
+	log.Println("server started at 8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 
 }
