@@ -29,6 +29,11 @@ type Server struct {
 	Weight int
 }
 
+var (
+	activeServers = make(map[string]*Server)
+	serverMtx     sync.Mutex
+)
+
 type ConsistantHash struct {
 	NumberVirtualNodes     int
 	key                    []int
@@ -55,6 +60,23 @@ func (ch *ConsistantHash) AddServer(s *Server) {
 	ch.mtx.Unlock()
 
 }
+func (ch *ConsistantHash) RemoveServer(s *Server) {
+	ch.mtx.Lock()
+	fmt.Println("stating removing")
+	for i := 0; i < (ch.NumberVirtualNodes * s.Weight); i++ {
+		urlString := s.url.String() + "#" + strconv.Itoa(i)
+		urlKey := HashHelper(urlString)
+		index := sort.SearchInts(ch.key, int(urlKey))
+		fmt.Println("Deleting :", urlString, urlKey)
+		if index < len(ch.key) && ch.key[index] == int(urlKey) {
+			fmt.Println("Deleting :", urlString, urlKey)
+			ch.key = slices.Delete(ch.key, index, index+1)
+			delete(ch.ServerMapping, int(urlKey))
+		}
+
+	}
+	ch.mtx.Unlock()
+}
 func (ch *ConsistantHash) GetServers(msg string) []*Server {
 	KeyHash := HashHelper(msg)
 	ch.mtx.Lock()
@@ -65,7 +87,7 @@ func (ch *ConsistantHash) GetServers(msg string) []*Server {
 	ans := make([]*Server, ch.NumberOfRepicationNode)
 	ans[0] = ch.ServerMapping[ch.key[index]]
 	for i := 1; i < ch.NumberOfRepicationNode; {
-		if ans[i-1].url.String() != ch.ServerMapping[ch.key[index]].url.String() {
+		if ans[i-1].url.String() != ch.ServerMapping[ch.key[index]].url.String() { //there is bug here if the number of replication node is greater than 3 we might not get the required number of replication node because we are not checking if the server is already in the ans array or not
 			ans[i] = ch.ServerMapping[ch.key[index]]
 			i++
 		}
@@ -107,8 +129,10 @@ func WatchDockerEvents(ch *ConsistantHash) {
 	filter := filters.NewArgs()
 	filter.Add("label", "com.docker.compose.service=node")
 	filter.Add("event", "start")
+	filter.Add("event", "kill")
 	filter.Add("event", "die")
-
+	filter.Add("event", "stop")
+	filter.Add("event", "destroy")
 	options := events.ListOptions{
 		Filters: filter,
 	}
@@ -120,6 +144,7 @@ func WatchDockerEvents(ch *ConsistantHash) {
 	for {
 		select {
 		case msg := <-msgs:
+			fmt.Println("Docker event received:", msg.Action, msg.Actor.ID)
 			go handleSingleEvent(ctx, cli, msg, ch)
 		case err := <-errs:
 			log.Printf("Docker event error: %v", err)
@@ -142,14 +167,36 @@ func handleSingleEvent(ctx context.Context, cli *client.Client, msg events.Messa
 				if err != nil {
 					log.Fatal("unable to parse the url")
 				}
-				ring.AddServer(&Server{
+				newServer := &Server{
 					url:    curUrl,
-					Weight: 5,
-				})
+					Weight: 2,
+				}
+				ring.AddServer(newServer)
+				serverMtx.Lock()
+				activeServers[msg.Actor.ID] = newServer
+				serverMtx.Unlock()
 				break // Only breaks the network-search loop
 			}
 		}
 	}
+	if msg.Action == "die" {
+		fmt.Println("removing server from ring", msg.Action, msg.Actor.ID)
+		serverMtx.Lock()
+		serverToRemove, exists := activeServers[msg.Actor.ID]
+		if exists {
+			delete(activeServers, msg.Actor.ID) // Remove from state map
+		}
+		serverMtx.Unlock()
+
+		// 2. Remove it from the consistent hash ring
+		if exists {
+			fmt.Println("Removing server from ring:", serverToRemove.url.String())
+			ring.RemoveServer(serverToRemove)
+		} else {
+			fmt.Println("Server not found in state map for ID:", msg.Actor.ID)
+		}
+	}
+
 }
 
 func RequestHandlerGet(w http.ResponseWriter, r *http.Request) {
